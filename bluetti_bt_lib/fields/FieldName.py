@@ -73,6 +73,7 @@ class FieldName(Enum):
     INTERNAL_DC_INPUT_VOLTAGE = "internal_dc_input_voltage"
     POWER_GENERATION = "power_generation"
     POWER_LIFTING_ON = "power_lifting_on"
+    TEMPERATURE = "temperature"
     PV_S1_CURRENT = "pv_s1_current"
     PV_S1_POWER = "pv_s1_power"
     PV_S1_VOLTAGE = "pv_s1_voltage"
