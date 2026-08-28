@@ -1,6 +1,13 @@
 from ..base_devices import BaseDeviceV2
 from ..enums import ChargingMode, EcoMode
-from ..fields import FieldName, UIntField, DecimalField, SwitchField, SelectField
+from ..fields import (
+    FieldName,
+    UIntField,
+    DecimalField,
+    SwitchField,
+    SelectField,
+    SerialNumberField,
+)
 
 
 class EL30V2(BaseDeviceV2):
@@ -14,6 +21,7 @@ class EL30V2(BaseDeviceV2):
                 UIntField(FieldName.AC_INPUT_POWER, 146),
                 DecimalField(FieldName.AC_INPUT_VOLTAGE, 1314, 1),
                 DecimalField(FieldName.TEMPERATURE, 1153, 1),
+                SerialNumberField(FieldName.COMMUNICATION_BOARD_SERIAL, 11006),
                 SwitchField(FieldName.CTRL_AC, 2011),
                 SwitchField(FieldName.CTRL_DC, 2012),
                 SwitchField(FieldName.CTRL_ECO_DC, 2014),
