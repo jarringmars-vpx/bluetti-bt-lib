@@ -27,8 +27,8 @@ class DeviceSessionConfig:
         self.timeout = timeout
         self.use_encryption = use_encryption
         self.command_timeout = command_timeout
-        self.command_retries = max(0, command_retries)
-        self.retry_delay = max(0.0, retry_delay)
+        self.command_retries = max(0, int(command_retries))
+        self.retry_delay = max(0.0, float(retry_delay))
 
 
 class DeviceSession:
@@ -245,7 +245,6 @@ class DeviceSession:
                         selector_body,
                     )
 
-                    # Give the power station time to populate pack registers.
                     await asyncio.sleep(3)
 
                     for register in pack_registers:
@@ -269,6 +268,103 @@ class DeviceSession:
                         parsed_data.update(parsed)
 
         return parsed_data or None
+
+    async def read_registers(
+        self,
+        starting_address: int,
+        count: int,
+    ) -> dict[int, int]:
+        """
+        Read one contiguous holding-register block over the persistent session.
+
+        Returns a mapping of absolute register address to unsigned 16-bit value.
+
+        This is intentionally a low-level public API. It does not require the
+        requested registers to have named device fields, which makes it useful
+        for efficient demand-driven polling of known-good blocks.
+
+        A short/malformed response is retried on the SAME authenticated BLE
+        session. It is not treated as a connection failure by itself.
+        """
+        if not self.is_ready:
+            raise RuntimeError(
+                "DeviceSession is not connected and ready. Call connect() first."
+            )
+
+        if not isinstance(starting_address, int):
+            raise TypeError("starting_address must be an integer")
+        if not isinstance(count, int):
+            raise TypeError("count must be an integer")
+        if starting_address < 0 or starting_address > 0xFFFF:
+            raise ValueError("starting_address must be between 0 and 65535")
+        if count < 1 or count > 125:
+            raise ValueError("count must be between 1 and 125")
+        if starting_address + count - 1 > 0xFFFF:
+            raise ValueError("requested register block exceeds address 65535")
+
+        registers = ReadableRegisters(starting_address, count)
+        attempts = self.config.command_retries + 1
+        last_error: Exception | None = None
+
+        async with self.command_lock:
+            async with async_timeout.timeout(self.config.timeout):
+                for attempt in range(attempts):
+                    try:
+                        response = await self._async_send_command(registers)
+                        body = registers.parse_response(response)
+
+                        expected_bytes = count * 2
+                        if len(body) != expected_bytes:
+                            raise ValueError(
+                                f"Expected {expected_bytes} data bytes for "
+                                f"{count} registers, got {len(body)}"
+                            )
+
+                        result: dict[int, int] = {}
+                        for offset in range(count):
+                            index = offset * 2
+                            value = int.from_bytes(
+                                body[index:index + 2],
+                                "big",
+                                signed=False,
+                            )
+                            result[starting_address + offset] = value
+
+                        return result
+
+                    except ValueError as err:
+                        last_error = err
+
+                        if not self.is_ready:
+                            raise RuntimeError(
+                                "BLE session became unavailable while reading "
+                                f"R{starting_address}-"
+                                f"R{starting_address + count - 1}"
+                            ) from err
+
+                        if attempt >= attempts - 1:
+                            raise
+
+                        self.logger.warning(
+                            "Malformed/short response reading R%d-R%d; "
+                            "retrying on same session after %.3fs: %s",
+                            starting_address,
+                            starting_address + count - 1,
+                            self.config.retry_delay,
+                            err,
+                        )
+
+                        self.notify_future = None
+                        self.notify_response.clear()
+                        self.encrypted_buffer.clear()
+
+                        if self.config.retry_delay:
+                            await asyncio.sleep(self.config.retry_delay)
+
+        if last_error is not None:
+            raise last_error
+
+        raise RuntimeError("Targeted register read ended unexpectedly")
 
     async def write(self, field: str, value: Any) -> bool:
         """
@@ -311,8 +407,6 @@ class DeviceSession:
                         None,
                     )
 
-                # Any unsolicited/previous notification data should not be
-                # mistaken for the response to the next read command.
                 self.notify_future = None
                 self.notify_response.clear()
                 self.encrypted_buffer.clear()
@@ -333,15 +427,21 @@ class DeviceSession:
         return True
 
     async def _async_send_command(self, registers: DeviceRegister) -> bytes:
-        """Send one request/response command, retrying a transient timeout."""
+        """
+        Send one request/response command over the current session.
+
+        Transient command timeouts are retried on the same BLE/encryption
+        session while the session remains connected and authenticated.
+        """
         attempts = self.config.command_retries + 1
 
-        for attempt in range(1, attempts + 1):
+        for attempt in range(attempts):
             if not self.client or not self.client.is_connected:
                 raise RuntimeError("BLE session is not connected")
 
-            if self.config.use_encryption and not self.encryption.is_ready_for_commands:
-                raise RuntimeError("Encrypted session is not ready")
+            if self.config.use_encryption:
+                if not self.encryption.is_ready_for_commands:
+                    raise RuntimeError("Encrypted session is not ready")
 
             self.current_registers = registers
             self.notify_response = bytearray()
@@ -349,19 +449,30 @@ class DeviceSession:
             self.encrypted_buffer.clear()
 
             command_bytes = bytes(registers)
+
             if self.config.use_encryption:
                 command_bytes = self.encryption.aes_encrypt(
-                    command_bytes, self.encryption.secure_aes_key, None
+                    command_bytes,
+                    self.encryption.secure_aes_key,
+                    None,
                 )
 
-            await self.client.write_gatt_char(WRITE_UUID, command_bytes)
+            await self.client.write_gatt_char(
+                WRITE_UUID,
+                command_bytes,
+            )
+
             self.logger.debug(
-                "Request sent (%s), attempt %d/%d", registers, attempt, attempts
+                "Request sent (%s), attempt %d/%d",
+                registers,
+                attempt + 1,
+                attempts,
             )
 
             try:
                 response = await asyncio.wait_for(
-                    self.notify_future, timeout=self.config.command_timeout
+                    self.notify_future,
+                    timeout=self.config.command_timeout,
                 )
             except asyncio.TimeoutError:
                 self.notify_future = None
@@ -369,34 +480,33 @@ class DeviceSession:
                 self.encrypted_buffer.clear()
 
                 connected = bool(self.client and self.client.is_connected)
-                secure = (
-                    not self.config.use_encryption
-                    or self.encryption.is_ready_for_commands
-                )
+                ready = self.is_ready
 
-                if attempt >= attempts or not connected or not secure:
-                    self.logger.warning(
-                        "Request timed out (%s), attempt %d/%d; "
-                        "connected=%s encryption_ready=%s",
-                        registers, attempt, attempts, connected, secure,
+                if not connected or not ready:
+                    raise RuntimeError(
+                        "BLE/encryption session became unavailable during "
+                        f"request: {registers}"
                     )
+
+                if attempt >= attempts - 1:
                     raise
 
                 self.logger.warning(
-                    "Transient request timeout (%s), attempt %d/%d; "
-                    "keeping session and retrying after %.3fs",
-                    registers, attempt, attempts, self.config.retry_delay,
+                    "Timed out waiting for %s; retrying on same session "
+                    "after %.3fs",
+                    registers,
+                    self.config.retry_delay,
                 )
+
                 if self.config.retry_delay:
                     await asyncio.sleep(self.config.retry_delay)
+
                 continue
 
-            self.logger.debug(
-                "Got response (%s), attempt %d/%d", registers, attempt, attempts
-            )
+            self.logger.debug("Got response")
             return cast(bytes, response)
 
-        raise RuntimeError("Command retry loop exited unexpectedly")
+        raise RuntimeError("Command retry loop ended unexpectedly")
 
     def _calculate_expected_encrypted_length(
         self,
