@@ -1,0 +1,505 @@
+import asyncio
+import logging
+from typing import Any, Callable, List, cast
+
+import async_timeout
+from bleak import BleakClient, BleakScanner
+from bleak_retry_connector import BleakClientWithServiceCache, establish_connection
+
+from .encryption import BluettiEncryption, Message, MessageType, AES_BLOCK_SIZE
+from ..base_devices import BluettiDevice
+from ..const import NOTIFY_UUID, WRITE_UUID
+from ..registers import ReadableRegisters, DeviceRegister
+from ..utils.privacy import mac_loggable
+
+
+class DeviceSessionConfig:
+    """Configuration for a persistent BLUETTI BLE session."""
+
+    def __init__(self, timeout: int = 60, use_encryption: bool = False):
+        self.timeout = timeout
+        self.use_encryption = use_encryption
+
+
+class DeviceSession:
+    """
+    Persistent BLUETTI BLE session.
+
+    A DeviceSession owns one BLE connection, one notification subscription,
+    one encryption context, and one command lock. Reads and writes therefore
+    use the same authenticated BLE session until disconnect() is called.
+    """
+
+    def __init__(
+        self,
+        mac: str,
+        bluetti_device: BluettiDevice,
+        future_builder_method: Callable[[], asyncio.Future[Any]],
+        config: DeviceSessionConfig | None = None,
+        lock: asyncio.Lock | None = None,
+        ble_client: BleakClient | None = None,
+    ):
+        self.mac = mac
+        self.bluetti_device = bluetti_device
+        self.create_future = future_builder_method
+        self.config = config or DeviceSessionConfig()
+        self.command_lock = lock or asyncio.Lock()
+
+        self.ble_client = ble_client
+        """Optional pre-created client, primarily useful for tests."""
+
+        self.logger = logging.getLogger(
+            f"{__name__}.{mac_loggable(mac).replace(':', '_')}"
+        )
+
+        self.device = None
+        self.client: BleakClient | None = None
+
+        self.has_notifier = False
+        self.current_registers: DeviceRegister | None = None
+        self.notify_response = bytearray()
+        self.notify_future: asyncio.Future[Any] | None = None
+
+        self.encryption = BluettiEncryption()
+        self.encrypted_buffer = bytearray()
+        self.encryption_ready = asyncio.Event()
+
+    @property
+    def is_connected(self) -> bool:
+        return bool(self.client and self.client.is_connected)
+
+    @property
+    def is_ready(self) -> bool:
+        if not self.is_connected:
+            return False
+        if not self.config.use_encryption:
+            return True
+        return self.encryption.is_ready_for_commands
+
+    async def connect(self) -> None:
+        """
+        Establish the BLE connection and notification subscription.
+
+        For encrypted devices, wait for the BLUETTI encryption handshake to
+        complete. Repeated calls are harmless while already connected/ready.
+        """
+        if self.is_ready:
+            return
+
+        async with self.command_lock:
+            if self.is_ready:
+                return
+
+            async with async_timeout.timeout(self.config.timeout):
+                if self.ble_client:
+                    self.device = None
+                    self.client = self.ble_client
+
+                    if not self.client.is_connected:
+                        await self.client.connect()
+                else:
+                    self.logger.debug("Searching for device")
+
+                    self.device = await BleakScanner.find_device_by_address(
+                        self.mac,
+                        timeout=5,
+                    )
+
+                    if self.device is None:
+                        raise RuntimeError("Device not found")
+
+                    self.logger.debug("Connecting to device")
+
+                    self.client = await establish_connection(
+                        BleakClientWithServiceCache,
+                        self.device,
+                        self.device.name or "Unknown Device",
+                        max_attempts=10,
+                    )
+
+                self.logger.debug("Connected to device")
+
+                if not self.has_notifier:
+                    await self.client.start_notify(
+                        NOTIFY_UUID,
+                        self._notification_handler,
+                    )
+                    self.has_notifier = True
+                    self.logger.debug("Notification handler setup complete")
+
+                if self.config.use_encryption:
+                    if self.encryption.is_ready_for_commands:
+                        self.encryption_ready.set()
+                    else:
+                        self.encryption_ready.clear()
+                        self.logger.debug(
+                            "Waiting for encryption handshake to complete"
+                        )
+
+                        await asyncio.wait_for(
+                            self.encryption_ready.wait(),
+                            timeout=self.config.timeout,
+                        )
+
+                    if not self.encryption.is_ready_for_commands:
+                        raise RuntimeError(
+                            "Encryption handshake did not produce a secure key"
+                        )
+
+                    self.logger.debug("Encryption handshake complete")
+
+    async def disconnect(self) -> None:
+        """Stop notifications, disconnect, and reset session state."""
+        async with self.command_lock:
+            if self.has_notifier and self.client:
+                try:
+                    await self.client.stop_notify(NOTIFY_UUID)
+                    self.logger.debug("Stopped notifier")
+                except Exception:
+                    pass
+
+                self.has_notifier = False
+
+            if self.client:
+                try:
+                    if self.client.is_connected:
+                        await self.client.disconnect()
+                        self.logger.debug("Disconnected from device")
+                finally:
+                    self.client = None
+
+            self.notify_future = None
+            self.notify_response.clear()
+            self.current_registers = None
+
+            self.encryption.reset()
+            self.encrypted_buffer.clear()
+            self.encryption_ready.clear()
+
+    async def read(
+        self,
+        only_registers: List[ReadableRegisters] | None = None,
+        raw: bool = False,
+    ) -> dict | None:
+        """
+        Read registers over the existing persistent BLE connection.
+
+        connect() must have completed successfully first. This method does not
+        stop notifications, disconnect, or reset encryption after the read.
+        """
+        if not self.is_ready:
+            raise RuntimeError(
+                "DeviceSession is not connected and ready. Call connect() first."
+            )
+
+        registers = self.bluetti_device.get_polling_registers()
+        pack_registers = self.bluetti_device.get_pack_polling_registers()
+
+        if only_registers is not None:
+            registers = only_registers
+            pack_registers = []
+
+        parsed_data: dict = {}
+
+        async with self.command_lock:
+            async with async_timeout.timeout(self.config.timeout):
+                for register in registers:
+                    body = register.parse_response(
+                        await self._async_send_command(register)
+                    )
+
+                    self.logger.debug("Raw data: %s", body)
+
+                    if raw:
+                        parsed_data[register.starting_address] = body
+                        continue
+
+                    parsed = self.bluetti_device.parse(
+                        register.starting_address,
+                        body,
+                    )
+
+                    self.logger.debug("Parsed data: %s", parsed)
+                    parsed_data.update(parsed)
+
+                for pack in range(1, self.bluetti_device.max_packs + 1):
+                    selector = self.bluetti_device.get_pack_selector(pack)
+
+                    selector_body = selector.parse_response(
+                        await self._async_send_command(selector)
+                    )
+
+                    self.logger.debug(
+                        "Pack selector response for pack %d: %s",
+                        pack,
+                        selector_body,
+                    )
+
+                    # Give the power station time to populate pack registers.
+                    await asyncio.sleep(3)
+
+                    for register in pack_registers:
+                        body = register.parse_response(
+                            await self._async_send_command(register)
+                        )
+
+                        self.logger.debug("Raw data: %s", body)
+
+                        if raw:
+                            parsed_data[register.starting_address] = body
+                            continue
+
+                        parsed = self.bluetti_device.parse(
+                            register.starting_address,
+                            body,
+                            pack_num=pack,
+                        )
+
+                        self.logger.debug("Parsed data: %s", parsed)
+                        parsed_data.update(parsed)
+
+        return parsed_data or None
+
+    async def write(self, field: str, value: Any) -> bool:
+        """
+        Write a device field over the existing persistent BLE connection.
+
+        The write uses the same BleakClient, notification subscription, and
+        encryption context as read(). This method does not reconnect,
+        re-authenticate, stop notifications, or disconnect.
+
+        The BLUETTI write protocol used by the existing DeviceWriter does not
+        currently parse a write acknowledgement, so callers that require
+        confirmation should perform a read-back after this method returns.
+        """
+        if not self.is_ready:
+            raise RuntimeError(
+                "DeviceSession is not connected and ready. Call connect() first."
+            )
+
+        available_fields = [f.name for f in self.bluetti_device.fields]
+
+        if field not in available_fields:
+            raise ValueError(f"Field not supported: {field}")
+
+        command = self.bluetti_device.build_write_command(field, value)
+
+        if command is None:
+            raise ValueError(f"Field is not writeable: {field}")
+
+        async with self.command_lock:
+            async with async_timeout.timeout(self.config.timeout):
+                command_bytes = bytes(command)
+
+                if self.config.use_encryption:
+                    if not self.encryption.is_ready_for_commands:
+                        raise RuntimeError("Encrypted session is not ready")
+
+                    command_bytes = self.encryption.aes_encrypt(
+                        command_bytes,
+                        self.encryption.secure_aes_key,
+                        None,
+                    )
+
+                # Any unsolicited/previous notification data should not be
+                # mistaken for the response to the next read command.
+                self.notify_future = None
+                self.notify_response.clear()
+                self.encrypted_buffer.clear()
+
+                self.logger.debug(
+                    "Writing field %s=%r over persistent session",
+                    field,
+                    value,
+                )
+
+                await self.client.write_gatt_char(
+                    WRITE_UUID,
+                    command_bytes,
+                )
+
+                self.logger.debug("Persistent write sent successfully")
+
+        return True
+
+    async def _async_send_command(self, registers: DeviceRegister) -> bytes:
+        """Send one request/response command over the current session."""
+        if not self.client or not self.client.is_connected:
+            raise RuntimeError("BLE session is not connected")
+
+        self.current_registers = registers
+        self.notify_response = bytearray()
+        self.notify_future = self.create_future()
+        self.encrypted_buffer.clear()
+
+        command_bytes = bytes(registers)
+
+        if self.config.use_encryption:
+            if not self.encryption.is_ready_for_commands:
+                raise RuntimeError("Encrypted session is not ready")
+
+            command_bytes = self.encryption.aes_encrypt(
+                command_bytes,
+                self.encryption.secure_aes_key,
+                None,
+            )
+
+        await self.client.write_gatt_char(
+            WRITE_UUID,
+            command_bytes,
+        )
+
+        self.logger.debug("Request sent (%s)", registers)
+
+        response = await asyncio.wait_for(
+            self.notify_future,
+            timeout=5,
+        )
+
+        self.logger.debug("Got response")
+        return cast(bytes, response)
+
+    def _calculate_expected_encrypted_length(
+        self,
+        buffer: bytearray,
+    ) -> int | None:
+        """Calculate expected total length of an encrypted message."""
+        if len(buffer) < 2:
+            return None
+
+        data_len = (buffer[0] << 8) + buffer[1]
+
+        key, iv = self.encryption.getKeyIv()
+
+        if iv is None:
+            header_size = 6
+        else:
+            header_size = 2
+
+        padded_len = (
+            (data_len + AES_BLOCK_SIZE - 1)
+            // AES_BLOCK_SIZE
+        ) * AES_BLOCK_SIZE
+
+        return header_size + padded_len
+
+    async def _notification_handler(
+        self,
+        _: int,
+        data: bytearray,
+    ):
+        """Handle handshake and command-response notifications."""
+        self.logger.debug("Got new data (%d bytes)", len(data))
+
+        if self.config.use_encryption:
+            message = Message(data)
+
+            if message.is_pre_key_exchange:
+                message.verify_checksum()
+
+                if message.type == MessageType.CHALLENGE:
+                    challenge_response = self.encryption.msg_challenge(
+                        message
+                    )
+
+                    if challenge_response is not None:
+                        await self.client.write_gatt_char(
+                            WRITE_UUID,
+                            challenge_response,
+                        )
+
+                    return
+
+                if message.type == MessageType.CHALLENGE_ACCEPTED:
+                    self.logger.debug("Challenge accepted")
+                    return
+
+                return
+
+            if self.encryption.unsecure_aes_key is None:
+                self.logger.error(
+                    "Received encrypted message before key initialization"
+                )
+                return
+
+            self.encrypted_buffer.extend(data)
+
+            expected_len = self._calculate_expected_encrypted_length(
+                self.encrypted_buffer
+            )
+
+            if expected_len is None:
+                return
+
+            if len(self.encrypted_buffer) < expected_len:
+                self.logger.debug(
+                    "Buffering fragment: %d/%d bytes",
+                    len(self.encrypted_buffer),
+                    expected_len,
+                )
+                return
+
+            complete_message = bytes(
+                self.encrypted_buffer[:expected_len]
+            )
+
+            if len(self.encrypted_buffer) > expected_len:
+                self.encrypted_buffer = self.encrypted_buffer[expected_len:]
+            else:
+                self.encrypted_buffer.clear()
+
+            key, iv = self.encryption.getKeyIv()
+
+            try:
+                decrypted = Message(
+                    self.encryption.aes_decrypt(
+                        complete_message,
+                        key,
+                        iv,
+                    )
+                )
+            except ValueError as err:
+                self.logger.error(
+                    "Decryption failed: %s",
+                    err,
+                )
+                self.encrypted_buffer.clear()
+                return
+
+            if decrypted.is_pre_key_exchange:
+                decrypted.verify_checksum()
+
+                if decrypted.type == MessageType.PEER_PUBKEY:
+                    peer_pubkey_response = self.encryption.msg_peer_pubkey(
+                        decrypted
+                    )
+
+                    if peer_pubkey_response is not None:
+                        await self.client.write_gatt_char(
+                            WRITE_UUID,
+                            peer_pubkey_response,
+                        )
+
+                    return
+
+                if decrypted.type == MessageType.PUBKEY_ACCEPTED:
+                    self.encryption.msg_key_accepted(decrypted)
+                    self.encryption_ready.set()
+
+                    self.logger.debug(
+                        "Secure encryption key established"
+                    )
+
+                    return
+
+            data = decrypted.buffer
+
+        self.notify_response.extend(data)
+
+        if self.notify_future is None:
+            return
+
+        if not self.notify_future.done():
+            self.notify_future.set_result(
+                bytes(self.notify_response)
+            )
