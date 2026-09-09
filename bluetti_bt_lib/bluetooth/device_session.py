@@ -16,9 +16,19 @@ from ..utils.privacy import mac_loggable
 class DeviceSessionConfig:
     """Configuration for a persistent BLUETTI BLE session."""
 
-    def __init__(self, timeout: int = 60, use_encryption: bool = False):
+    def __init__(
+        self,
+        timeout: int = 60,
+        use_encryption: bool = False,
+        command_timeout: float = 5.0,
+        command_retries: int = 1,
+        retry_delay: float = 0.4,
+    ):
         self.timeout = timeout
         self.use_encryption = use_encryption
+        self.command_timeout = command_timeout
+        self.command_retries = max(0, command_retries)
+        self.retry_delay = max(0.0, retry_delay)
 
 
 class DeviceSession:
@@ -323,41 +333,70 @@ class DeviceSession:
         return True
 
     async def _async_send_command(self, registers: DeviceRegister) -> bytes:
-        """Send one request/response command over the current session."""
-        if not self.client or not self.client.is_connected:
-            raise RuntimeError("BLE session is not connected")
+        """Send one request/response command, retrying a transient timeout."""
+        attempts = self.config.command_retries + 1
 
-        self.current_registers = registers
-        self.notify_response = bytearray()
-        self.notify_future = self.create_future()
-        self.encrypted_buffer.clear()
+        for attempt in range(1, attempts + 1):
+            if not self.client or not self.client.is_connected:
+                raise RuntimeError("BLE session is not connected")
 
-        command_bytes = bytes(registers)
-
-        if self.config.use_encryption:
-            if not self.encryption.is_ready_for_commands:
+            if self.config.use_encryption and not self.encryption.is_ready_for_commands:
                 raise RuntimeError("Encrypted session is not ready")
 
-            command_bytes = self.encryption.aes_encrypt(
-                command_bytes,
-                self.encryption.secure_aes_key,
-                None,
+            self.current_registers = registers
+            self.notify_response = bytearray()
+            self.notify_future = self.create_future()
+            self.encrypted_buffer.clear()
+
+            command_bytes = bytes(registers)
+            if self.config.use_encryption:
+                command_bytes = self.encryption.aes_encrypt(
+                    command_bytes, self.encryption.secure_aes_key, None
+                )
+
+            await self.client.write_gatt_char(WRITE_UUID, command_bytes)
+            self.logger.debug(
+                "Request sent (%s), attempt %d/%d", registers, attempt, attempts
             )
 
-        await self.client.write_gatt_char(
-            WRITE_UUID,
-            command_bytes,
-        )
+            try:
+                response = await asyncio.wait_for(
+                    self.notify_future, timeout=self.config.command_timeout
+                )
+            except asyncio.TimeoutError:
+                self.notify_future = None
+                self.notify_response.clear()
+                self.encrypted_buffer.clear()
 
-        self.logger.debug("Request sent (%s)", registers)
+                connected = bool(self.client and self.client.is_connected)
+                secure = (
+                    not self.config.use_encryption
+                    or self.encryption.is_ready_for_commands
+                )
 
-        response = await asyncio.wait_for(
-            self.notify_future,
-            timeout=5,
-        )
+                if attempt >= attempts or not connected or not secure:
+                    self.logger.warning(
+                        "Request timed out (%s), attempt %d/%d; "
+                        "connected=%s encryption_ready=%s",
+                        registers, attempt, attempts, connected, secure,
+                    )
+                    raise
 
-        self.logger.debug("Got response")
-        return cast(bytes, response)
+                self.logger.warning(
+                    "Transient request timeout (%s), attempt %d/%d; "
+                    "keeping session and retrying after %.3fs",
+                    registers, attempt, attempts, self.config.retry_delay,
+                )
+                if self.config.retry_delay:
+                    await asyncio.sleep(self.config.retry_delay)
+                continue
+
+            self.logger.debug(
+                "Got response (%s), attempt %d/%d", registers, attempt, attempts
+            )
+            return cast(bytes, response)
+
+        raise RuntimeError("Command retry loop exited unexpectedly")
 
     def _calculate_expected_encrypted_length(
         self,
