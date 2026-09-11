@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import time
+from datetime import datetime
 from typing import Any, Callable, List, cast
 
 import async_timeout
@@ -73,6 +75,25 @@ class DeviceSession:
         self.encryption = BluettiEncryption()
         self.encrypted_buffer = bytearray()
         self.encryption_ready = asyncio.Event()
+
+        # Per-command diagnostics are intentionally buffered instead of
+        # printed here so the GUI can keep one logical scan on one console
+        # line. Entries are consumed after each public read_registers() call.
+        self._scan_diagnostics: list[str] = []
+
+        # Request/response correlation diagnostics. These do not change the
+        # protocol behavior; they only preserve enough context to identify
+        # which exact Modbus request was active when an unexpected response
+        # or timeout occurred.
+        self._request_sequence = 0
+        self._active_request_id: int | None = None
+        self._active_request_plain = b""
+        self._active_request_description = ""
+        self._active_request_sent_monotonic: float | None = None
+        self._last_response_request_id: int | None = None
+        self._last_response_timestamp = ""
+        self._last_response_delay: float | None = None
+        self._orphan_diagnostics: list[str] = []
 
     @property
     def is_connected(self) -> bool:
@@ -185,6 +206,15 @@ class DeviceSession:
             self.encryption.reset()
             self.encrypted_buffer.clear()
             self.encryption_ready.clear()
+            self._scan_diagnostics.clear()
+            self._orphan_diagnostics.clear()
+            self._active_request_id = None
+            self._active_request_plain = b""
+            self._active_request_description = ""
+            self._active_request_sent_monotonic = None
+            self._last_response_request_id = None
+            self._last_response_timestamp = ""
+            self._last_response_delay = None
 
     async def read(
         self,
@@ -269,6 +299,18 @@ class DeviceSession:
 
         return parsed_data or None
 
+    def consume_scan_diagnostics(self) -> list[str]:
+        """
+        Return and clear diagnostics collected by the most recent targeted read.
+
+        This keeps lower-level timeout/malformed-response evidence available
+        to callers without forcing DeviceSession to print extra console lines.
+        """
+        diagnostics = list(self._orphan_diagnostics) + list(self._scan_diagnostics)
+        self._orphan_diagnostics.clear()
+        self._scan_diagnostics.clear()
+        return diagnostics
+
     async def read_registers(
         self,
         starting_address: int,
@@ -306,6 +348,10 @@ class DeviceSession:
         attempts = self.config.command_retries + 1
         last_error: Exception | None = None
 
+        # One public targeted scan owns one diagnostics bundle. _async_send_command
+        # may append timeout information; this method may append parse/length data.
+        self._scan_diagnostics.clear()
+
         async with self.command_lock:
             async with async_timeout.timeout(self.config.timeout):
                 for attempt in range(attempts):
@@ -315,6 +361,26 @@ class DeviceSession:
 
                         expected_bytes = count * 2
                         if len(body) != expected_bytes:
+                            response_hex = bytes(response).hex(" ").upper()
+                            body_hex = bytes(body).hex(" ").upper()
+                            request_hex = self._active_request_plain.hex(" ").upper()
+                            response_delay = (
+                                f"{self._last_response_delay:.3f}s"
+                                if self._last_response_delay is not None
+                                else "unknown"
+                            )
+                            self._scan_diagnostics.append(
+                                "UNEXPECTED "
+                                f"request_id={self._last_response_request_id} "
+                                f"request={self._active_request_description} "
+                                f"TXHex={request_hex} "
+                                f"RXat={self._last_response_timestamp or 'unknown'} "
+                                f"rx_after={response_delay} "
+                                f"expected={expected_bytes}B "
+                                f"actual={len(body)}B "
+                                f"ResponseHex={response_hex} "
+                                f"DataHex={body_hex}"
+                            )
                             raise ValueError(
                                 f"Expected {expected_bytes} data bytes for "
                                 f"{count} registers, got {len(body)}"
@@ -345,7 +411,10 @@ class DeviceSession:
                         if attempt >= attempts - 1:
                             raise
 
-                        self.logger.warning(
+                        self._scan_diagnostics.append(
+                            f"RETRY reason=malformed delay={self.config.retry_delay:.3f}s"
+                        )
+                        self.logger.debug(
                             "Malformed/short response reading R%d-R%d; "
                             "retrying on same session after %.3fs: %s",
                             starting_address,
@@ -432,6 +501,10 @@ class DeviceSession:
 
         Transient command timeouts are retried on the same BLE/encryption
         session while the session remains connected and authenticated.
+
+        v0.6 also records the exact plaintext Modbus TX request and the timing
+        of the response that satisfied the current future. This is diagnostic
+        only and intentionally does not alter retry/synchronization behavior.
         """
         attempts = self.config.command_retries + 1
 
@@ -448,8 +521,17 @@ class DeviceSession:
             self.notify_future = self.create_future()
             self.encrypted_buffer.clear()
 
-            command_bytes = bytes(registers)
+            plain_command = bytes(registers)
+            self._request_sequence += 1
+            self._active_request_id = self._request_sequence
+            self._active_request_plain = plain_command
+            self._active_request_description = str(registers)
+            self._active_request_sent_monotonic = time.monotonic()
+            self._last_response_request_id = None
+            self._last_response_timestamp = ""
+            self._last_response_delay = None
 
+            command_bytes = plain_command
             if self.config.use_encryption:
                 command_bytes = self.encryption.aes_encrypt(
                     command_bytes,
@@ -463,10 +545,12 @@ class DeviceSession:
             )
 
             self.logger.debug(
-                "Request sent (%s), attempt %d/%d",
+                "Request sent (%s), request_id=%d, attempt %d/%d, TX=%s",
                 registers,
+                self._active_request_id,
                 attempt + 1,
                 attempts,
+                plain_command.hex(" ").upper(),
             )
 
             try:
@@ -475,6 +559,10 @@ class DeviceSession:
                     timeout=self.config.command_timeout,
                 )
             except asyncio.TimeoutError:
+                request_id = self._active_request_id
+                request_hex = self._active_request_plain.hex(" ").upper()
+                request_description = self._active_request_description
+
                 self.notify_future = None
                 self.notify_response.clear()
                 self.encrypted_buffer.clear()
@@ -491,7 +579,16 @@ class DeviceSession:
                 if attempt >= attempts - 1:
                     raise
 
-                self.logger.warning(
+                self._scan_diagnostics.append(
+                    "TIMEOUT "
+                    f"request_id={request_id} "
+                    f"request={request_description} "
+                    f"TXHex={request_hex} "
+                    f"waited={self.config.command_timeout:.3f}s "
+                    f"retry_delay={self.config.retry_delay:.3f}s "
+                    f"attempt={attempt + 1}/{attempts}"
+                )
+                self.logger.debug(
                     "Timed out waiting for %s; retrying on same session "
                     "after %.3fs",
                     registers,
@@ -645,10 +742,31 @@ class DeviceSession:
 
         self.notify_response.extend(data)
 
+        rx_timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        rx_delay = None
+        if self._active_request_sent_monotonic is not None:
+            rx_delay = time.monotonic() - self._active_request_sent_monotonic
+
         if self.notify_future is None:
+            # A complete decrypted Modbus-like payload arrived while no
+            # command future was active. Preserve it for the next caller so
+            # we can determine whether the device emits true unsolicited data.
+            orphan_hex = bytes(self.notify_response).hex(" ").upper()
+            delay_text = f"{rx_delay:.3f}s" if rx_delay is not None else "unknown"
+            self._orphan_diagnostics.append(
+                "ORPHAN_RX "
+                f"RXat={rx_timestamp} "
+                f"after_last_tx={delay_text} "
+                f"len={len(self.notify_response)}B "
+                f"ResponseHex={orphan_hex}"
+            )
+            self.notify_response.clear()
             return
 
         if not self.notify_future.done():
+            self._last_response_request_id = self._active_request_id
+            self._last_response_timestamp = rx_timestamp
+            self._last_response_delay = rx_delay
             self.notify_future.set_result(
                 bytes(self.notify_response)
             )
