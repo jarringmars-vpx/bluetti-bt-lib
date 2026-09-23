@@ -214,3 +214,11 @@ tests/registers/logs/
 # BLUETTI research generated output
 community_el30v2_*.txt
 tests/registers/logs/
+
+# Text files and Log Output
+*.txt
+*.csv
+*.log
+
+# Archived files
+*.zip
