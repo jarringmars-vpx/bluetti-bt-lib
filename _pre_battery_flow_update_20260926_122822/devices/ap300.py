@@ -1,8 +1,7 @@
 from ..base_devices import BaseDeviceV2
-from ..enums import BatteryFlowState, ChargingMode, EcoMode
+from ..enums import ChargingMode, EcoMode
 from ..fields import (
     FieldName,
-    EnumField,
     UIntField,
     DecimalField,
     SwitchField,
@@ -11,19 +10,27 @@ from ..fields import (
 )
 
 
-class EL30V2(BaseDeviceV2):
-    self_consumption_watts = 9.0
+class AP300(BaseDeviceV2):
+    """AP300 register map confirmed while attached through an HA system.
+
+    The tested AP300 map substantially matches EL30V2. Temperature register
+    1153 is intentionally omitted because no AP300 temperature response has
+    been observed there. Register 154 is also intentionally omitted pending
+    identification; testing shows it behaves as an independent per-device
+    counter that increments roughly every five minutes. It is exposed with an
+    explicitly unknown semantic name rather than being guessed as PV data.
+    """
+
     def __init__(self):
         super().__init__(
             [
                 DecimalField(FieldName.TIME_REMAINING, 104, 4, 167),
+                UIntField(FieldName.UNKNOWN_COUNTER_154, 154),
                 UIntField(FieldName.DC_OUTPUT_POWER, 140),
                 UIntField(FieldName.AC_OUTPUT_POWER, 142),
                 UIntField(FieldName.DC_INPUT_POWER, 144),
                 UIntField(FieldName.AC_INPUT_POWER, 146),
                 DecimalField(FieldName.AC_INPUT_VOLTAGE, 1314, 1),
-                EnumField(FieldName.BATTERY_FLOW, 6009, BatteryFlowState),
-                DecimalField(FieldName.TEMPERATURE, 1153, 1),
                 SerialNumberField(FieldName.COMMUNICATION_BOARD_SERIAL, 11006),
                 SwitchField(FieldName.CTRL_AC, 2011),
                 SwitchField(FieldName.CTRL_DC, 2012),

@@ -4,9 +4,9 @@ from . import DeviceRegister, RegisterAction
 
 
 class ReadableRegisters(DeviceRegister):
-    def __init__(self, starting_address: int, quantity: int):
+    def __init__(self, starting_address: int, quantity: int, slave_address: int = 1):
         super().__init__(
-            RegisterAction.READ, struct.pack("!HH", starting_address, quantity)
+            RegisterAction.READ, struct.pack("!HH", starting_address, quantity), slave_address
         )
         self.starting_address = starting_address
         self.quantity = quantity
@@ -21,4 +21,4 @@ class ReadableRegisters(DeviceRegister):
         return bytes(response[3:-2])
 
     def __repr__(self):
-        return f"ReadableRegisters(starting_address={self.starting_address}, quantity={self.quantity})"
+        return f"ReadableRegisters(starting_address={self.starting_address}, quantity={self.quantity}, slave_address={self.slave_address})"

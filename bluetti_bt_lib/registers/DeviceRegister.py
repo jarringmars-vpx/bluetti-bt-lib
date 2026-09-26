@@ -11,11 +11,14 @@ class RegisterAction(Enum):
 
 
 class DeviceRegister:
-    def __init__(self, register_action: RegisterAction, data: bytes):
+    def __init__(self, register_action: RegisterAction, data: bytes, slave_address: int = 1):
         self.register_action = register_action
 
         self.cmd = bytearray(len(data) + 4)
-        self.cmd[0] = 1
+        if not 0 <= slave_address <= 247:
+            raise ValueError("slave_address must be between 0 and 247")
+        self.slave_address = slave_address
+        self.cmd[0] = slave_address
         self.cmd[1] = register_action.value
         self.cmd[2:-2] = data
         struct.pack_into("<H", self.cmd, -2, modbus_crc(self.cmd[:-2]))

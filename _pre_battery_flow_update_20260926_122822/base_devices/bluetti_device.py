@@ -5,8 +5,6 @@ from ..fields import DeviceField, BoolField, BoolFieldNonZero, SwitchField, Sele
 
 
 class BluettiDevice:
-    # Default used when a model-specific published value is unavailable.
-    self_consumption_watts = 20.0
     def __init__(
         self,
         fields: List[DeviceField],

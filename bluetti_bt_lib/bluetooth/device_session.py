@@ -11,7 +11,7 @@ from bleak_retry_connector import BleakClientWithServiceCache, establish_connect
 from .encryption import BluettiEncryption, Message, MessageType, AES_BLOCK_SIZE
 from ..base_devices import BluettiDevice
 from ..const import NOTIFY_UUID, WRITE_UUID
-from ..registers import ReadableRegisters, DeviceRegister
+from ..registers import ReadableRegisters, WriteableRegister, DeviceRegister
 from ..utils.privacy import mac_loggable
 
 
@@ -315,6 +315,7 @@ class DeviceSession:
         self,
         starting_address: int,
         count: int,
+        slave_address: int = 1,
     ) -> dict[int, int]:
         """
         Read one contiguous holding-register block over the persistent session.
@@ -343,8 +344,12 @@ class DeviceSession:
             raise ValueError("count must be between 1 and 125")
         if starting_address + count - 1 > 0xFFFF:
             raise ValueError("requested register block exceeds address 65535")
+        if not isinstance(slave_address, int):
+            raise TypeError("slave_address must be an integer")
+        if slave_address < 0 or slave_address > 247:
+            raise ValueError("slave_address must be between 0 and 247")
 
-        registers = ReadableRegisters(starting_address, count)
+        registers = ReadableRegisters(starting_address, count, slave_address=slave_address)
         attempts = self.config.command_retries + 1
         last_error: Exception | None = None
 
@@ -434,6 +439,26 @@ class DeviceSession:
             raise last_error
 
         raise RuntimeError("Targeted register read ended unexpectedly")
+
+    async def write_register(self, address: int, value: int, slave_address: int = 1) -> bool:
+        """Write one confirmed holding register to a selected Modbus slave."""
+        if not self.is_ready:
+            raise RuntimeError("DeviceSession is not connected and ready. Call connect() first.")
+        command = WriteableRegister(int(address), int(value), slave_address=int(slave_address))
+        async with self.command_lock:
+            async with async_timeout.timeout(self.config.timeout):
+                command_bytes = bytes(command)
+                if self.config.use_encryption:
+                    if not self.encryption.is_ready_for_commands:
+                        raise RuntimeError("Encrypted session is not ready")
+                    command_bytes = self.encryption.aes_encrypt(
+                        command_bytes, self.encryption.secure_aes_key, None
+                    )
+                self.notify_future = None
+                self.notify_response.clear()
+                self.encrypted_buffer.clear()
+                await self.client.write_gatt_char(WRITE_UUID, command_bytes)
+        return True
 
     async def write(self, field: str, value: Any) -> bool:
         """

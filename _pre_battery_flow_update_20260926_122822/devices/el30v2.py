@@ -1,8 +1,7 @@
 from ..base_devices import BaseDeviceV2
-from ..enums import BatteryFlowState, ChargingMode, EcoMode
+from ..enums import ChargingMode, EcoMode
 from ..fields import (
     FieldName,
-    EnumField,
     UIntField,
     DecimalField,
     SwitchField,
@@ -12,7 +11,6 @@ from ..fields import (
 
 
 class EL30V2(BaseDeviceV2):
-    self_consumption_watts = 9.0
     def __init__(self):
         super().__init__(
             [
@@ -22,7 +20,6 @@ class EL30V2(BaseDeviceV2):
                 UIntField(FieldName.DC_INPUT_POWER, 144),
                 UIntField(FieldName.AC_INPUT_POWER, 146),
                 DecimalField(FieldName.AC_INPUT_VOLTAGE, 1314, 1),
-                EnumField(FieldName.BATTERY_FLOW, 6009, BatteryFlowState),
                 DecimalField(FieldName.TEMPERATURE, 1153, 1),
                 SerialNumberField(FieldName.COMMUNICATION_BOARD_SERIAL, 11006),
                 SwitchField(FieldName.CTRL_AC, 2011),
